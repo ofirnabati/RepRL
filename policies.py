@@ -13,7 +13,7 @@ from functools import partial
 
 class Policy(object):
 
-    def __init__(self, policy_params):
+    def __init__(self, policy_params, device='cpu:0'):
 
         self.ob_dim = policy_params['ob_dim']
         self.ac_dim = policy_params['ac_dim']
@@ -22,13 +22,16 @@ class Policy(object):
         # a filter for updating statistics of the observations and normalizing inputs to the policies
         self.observation_filter = get_filter(policy_params['ob_filter'], shape = (self.ob_dim,))
         self.update_filter = True
+
+        self.device = device
         
     def update_weights(self, new_weights):
-        self.weights[:] = new_weights[:]
+        W, _ = new_weights
+        self.weights[:] = W[0][:]
         return
 
     def get_weights(self):
-        return self.weights
+        return [tuple([self.weights]), []]
 
     def get_observation_filter(self):
         return self.observation_filter
@@ -46,20 +49,30 @@ class LinearPolicy(Policy):
 
     def __init__(self, policy_params):
         Policy.__init__(self, policy_params)
-        self.weights = np.zeros((self.ac_dim, self.ob_dim), dtype = np.float64)
+        self.weights = torch.zeros(self.ac_dim, self.ob_dim, dtype = torch.float32, device=self.device)
 
     def act(self, ob):
         ob = self.observation_filter(ob, update=self.update_filter)
-        return np.dot(self.weights, ob)
+        if len(ob.shape) > 1:
+            ob = ob.flatten().astype(np.float32)
+        ob = self.observation_filter(ob, update=self.update_filter)
+        ob = torch.tensor(ob).float().to(self.device)
+        out = torch.matmul(self.weights, ob)
+        return out.cpu().numpy()
 
     def get_weights_plus_stats(self):
         
         mu, std = self.observation_filter.get_stats()
-        aux = np.asarray([self.weights, mu, std])
+        aux = [self.weights, [], mu, std]
         return aux
 
-
-
+    def get_stats(self):
+        mu, std = self.observation_filter.get_stats()
+        mu = torch.tensor(mu).float()
+        std = torch.tensor(std).float() + 1e-8
+        mu = -mu / std
+        std = torch.diag(1 / std)
+        return tuple([mu]), tuple([std])
 
 class BasicModel(nn.Module):
     def __init__(self,):
@@ -164,3 +177,88 @@ class DiscretePolicy(BasicModel):
             nn.init.orthogonal_(module.weight, gain=gain)
             if module.bias is not None:
                 module.bias.data.fill_(0.0)
+
+
+class StableBaselinePolicy(BasicModel):
+  """
+  Usage:
+
+  ```
+  policy = TanhGaussianPolicy(...)
+  action, mean, log_std, _ = policy(obs)
+  action, mean, log_std, _ = policy(obs, deterministic=True)
+  action, mean, log_std, log_prob = policy(obs, return_log_prob=True)
+  ```
+  Here, mean and log_std are the mean and log_std of the Gaussian that is
+  sampled from.
+
+  If deterministic is True, action = tanh(mean).
+  If return_log_prob is False (default), log_prob = None
+      This is done because computing the log_prob can be a bit expensive.
+  """
+
+  def __init__(
+          self,
+          obs_dim,
+          action_dim,
+          ob_filter,
+          device,
+          hidden_size=64,
+          std=None,
+          log_std_init=0.0,
+          init_w=1e-3,
+          **kwargs
+  ):
+    super(StableBaselinePolicy, self).__init__()
+    self.log_std = None
+    self.std = std
+    self.deterministic = False
+    self.net = nn.Sequential(
+        nn.Linear(obs_dim, hidden_size),
+        nn.Tanh(),
+        nn.Linear(hidden_size, hidden_size),
+        nn.Tanh(),
+        nn.Linear(hidden_size, action_dim),
+    )
+
+    self.observation_filter = get_filter(ob_filter, shape=(obs_dim,))
+    self.update_filter = True
+    self.device = device
+    # self.action_dist = DiagGaussianDistribution(action_dim)
+    # self.action_net, self.log_std = self.action_dist.proba_distribution_net(latent_dim=hidden_size,log_std_init=log_std_init)
+
+    # module_gains = {
+    #     self.net: np.sqrt(2),
+    #     self.action_net: 0.0#0.01,
+    # }
+    # for module, gain in module_gains.items():
+    #     module.apply(partial(self.init_weights, gain=gain))
+
+  def get_weights_plus_stats(self):
+      mu, std = self.observation_filter.get_stats()
+      weights = self.get_weights()
+      aux = np.asarray([weights, mu, std])
+      return aux
+
+  def act(self,obs):
+    with torch.no_grad():
+        obs = self.observation_filter(obs, update=self.update_filter)
+        obs = torch.tensor(obs).float().to(self.device)
+        return self.forward(obs)
+
+  def forward(
+          self,
+          obs,
+  ):
+    """
+    :param obs: Observation
+    :param deterministic: If True, do not sample
+    :param return_log_prob: If True, return a sample and its log probability
+    """
+
+    h = self.net(obs)
+    # mean_actions = self.action_net(h)
+    # dist = self.action_dist.proba_distribution(mean_actions, self.log_std)
+    # action = dist.get_actions(deterministic=self.deterministic)
+    # return action.cpu().numpy()
+    return h.cpu().numpy()

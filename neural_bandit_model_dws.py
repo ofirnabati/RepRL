@@ -25,8 +25,12 @@ class ConcatWeights(nn.Module):
     def forward(self, x, start_dim=1):
         weights, biases = x
         W = torch.concat([w.flatten(start_dim=start_dim) for w in weights], dim=-1)
-        B = torch.concat([b.flatten(start_dim=start_dim) for b in biases], dim=-1)
-        return torch.concat([W, B], dim=-1)
+        if len(biases) > 0:
+            B = torch.concat([b.flatten(start_dim=start_dim) for b in biases], dim=-1)
+            X = torch.concat([W,B], dim=-1)
+        else:
+            X = W
+        return X
 
 
 
@@ -45,14 +49,12 @@ class NeuralBanditModelDWS(nn.Module):
             for size in hparams.bias_shapes:
                 self.latent_dim += size.numel()
         else:
-            if self.use_invariant_layer:
-                self.latent_dim = hparams.latent_dim
-            else:
-                self.latent_dim = 0
-                for size in hparams.weight_shapes:
-                    self.latent_dim += size.numel()  * self.output_features
-                for size in hparams.bias_shapes:
-                    self.latent_dim += size.numel()  * self.output_features
+            self.latent_dim = hparams.latent_dim
+            self.dws_dim = 0
+            for size in hparams.weight_shapes:
+                self.dws_dim += size.numel()  * self.output_features
+            for size in hparams.bias_shapes:
+                self.dws_dim += size.numel()  * self.output_features
 
         self.non_linear_func = nn.ReLU
 
@@ -90,6 +92,9 @@ class NeuralBanditModelDWS(nn.Module):
         self.relu = ReLU()
 
         clf_layers = []
+        clf_layers.append(nn.Linear(self.dws_dim, self.latent_dim, bias=True))
+        if hparams.add_bn:
+            clf_layers.append(nn.BatchNorm1d(self.latent_dim))
         for k in range(hparams.clf_layers - 1):
             clf_layers.append(nn.Linear(self.latent_dim, self.latent_dim, bias=True))
             if hparams.add_bn:
@@ -98,23 +103,36 @@ class NeuralBanditModelDWS(nn.Module):
         clf_layers.append(nn.Linear(self.latent_dim, self.latent_dim, bias=True))
         self.clf = nn.Sequential(*clf_layers)
 
-        self.last_layer = (nn.Linear(self.latent_dim, 1, bias=False))
+        self.fc_mu = nn.Linear(self.latent_dim, self.latent_dim)
+        self.fc_var = nn.Linear(self.latent_dim, self.latent_dim)
+        self.value_pred = nn.Linear(self.latent_dim, 1, bias=False)
+        # self.last_layer = (nn.Linear(self.latent_dim, 1, bias=False))
 
-    def forward(self,  policy, encode_policy=True ):
+    def feature_extractor(self, policy):
+        encoded_policy = self.policy_embedder(policy)
+        z = encoded_policy
+        z = self.clf(z)
+        return z
+
+
+    def forward(self,  policy):
         if self.no_embedding:
             z = self.concat_weights(policy)
             return torch.zeros_like(z[:, 0]), z
         else:
-            if encode_policy:
-                self.encoded_policy = self.policy_embedder(policy)
-            z = self.encoded_policy
-            z = self.clf(z)
-            mean_value = self.last_layer(z)
-            return mean_value, z
+            mu, _   = self.encode(policy)
+            mean_value = self.value_pred(mu)
+            return mean_value, mu
 
-    def forward_sample(self, policy, encode_policy=True ):
-        mean_value, z = self.forward(policy, encode_policy )
-        return mean_value, z, None, None
+    def forward_sample(self, policy):
+        if self.no_embedding:
+            z = self.concat_weights(policy)
+            return torch.zeros_like(z[:,0]), z, None, None
+        else:
+            mu, log_var   = self.encode( policy)
+            z = self.reparameterize(mu, log_var)
+            value = self.value_pred(z)
+            return value, z ,mu, log_var
 
 
     def set_weights(self, weights):
@@ -123,23 +141,14 @@ class NeuralBanditModelDWS(nn.Module):
     def get_weights(self):
         return {k: v.cpu() for k, v in self.state_dict().items()}
 
-    def encode(self, state, policy):
+    def encode(self, policy):
         if self.no_embedding:
-            z = self.concat_weights(policy)
-            if self.state_based:
-                z = torch.cat([z, state], dim=-1)
-                z = self.mixed_latent(z)
-            return z, None
+            return  self.concat_weights(policy), None
         else:
-            z = self.policy_embedder(policy)
-            if self.state_based:
-                state_latent = self.state_embedder(state)
-                if z.shape[0] != state_latent.shape[0] and z.shape[0] == 1:
-                    z = torch.cat([z for _ in range(state_latent.shape[0])],dim=0)
-                z = torch.cat([z, state_latent], dim=-1)
-                z = self.mixed_latent(z)
-            z = self.clf(z)
-            return z, None
+            z = self.feature_extractor(policy)
+            mu = self.fc_mu(z)
+            log_var = self.fc_var(z)
+            return mu, log_var
 
     # def decode(self, z):
     #     return self.decoder(z)
@@ -150,9 +159,25 @@ class NeuralBanditModelDWS(nn.Module):
         B = torch.concat([b.flatten(start_dim=start_dim) for b in biases], dim=-1)
         return torch.concat([W,B],dim=-1)
 
-    def sample(self, state, policy):
-        x, _ = self.encode(state,policy)
-        return x
+    def sample(self, policy):
+        if self.no_embedding:
+            return self.concat_weights(policy)
+        else:
+            mu, log_var = self.encode(policy)
+            z = self.reparameterize(mu, log_var)
+            return z
+
+    def reparameterize(self, mu, logvar):
+        """
+        Will a single z be enough ti compute the expectation
+        for the loss??
+        :param mu: (Tensor) Mean of the latent Gaussian
+        :param logvar: (Tensor) Standard deviation of the latent Gaussian
+        :return:
+        """
+        std = torch.exp(0.5 * logvar)
+        eps = torch.randn_like(std)
+        return eps * std + mu
 
 
     def get_last_layer_weights(self):

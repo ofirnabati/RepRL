@@ -4,7 +4,8 @@ import numpy as np
 import torch
 from torch.distributions.multivariate_normal import MultivariateNormal
 from torch.utils.data import Dataset, DataLoader
-from neural_bandit_model_dws import NeuralBanditModelDWS as NeuralBanditModelDWS
+from neural_bandit_model_dws import NeuralBanditModelDWS
+from neural_bandit_model import NeuralBanditModelVAEGaussian
 from exp_dws.data import ReprlDataset
 from scipy.stats import invgamma
 
@@ -24,6 +25,7 @@ class NeuralLinearPosteriorSampling:
 
     self._lambda_prior = self.hparams.lambda_prior
     self.device = device
+    self.policy_type = hparams.policy_type
 
 
 
@@ -94,8 +96,12 @@ class NeuralLinearPosteriorSampling:
 
 
   def init_model(self):
-      self.model = NeuralBanditModelDWS(self.hparams).to(self.device)
-      self.target_model = NeuralBanditModelDWS(self.hparams).to(self.device)
+      if self.policy_type == 'linear':
+          self.model = NeuralBanditModelVAEGaussian(self.hparams).to(self.device)
+          self.target_model = NeuralBanditModelVAEGaussian(self.hparams).to(self.device)
+      else:
+          self.model = NeuralBanditModelDWS(self.hparams).to(self.device)
+          self.target_model = NeuralBanditModelDWS(self.hparams).to(self.device)
       self.target_model.load_state_dict(self.model.state_dict())
       for param in self.target_model.parameters():
           param.requires_grad = False
@@ -150,16 +156,15 @@ class NeuralLinearPosteriorSampling:
 
     self.model.eval()
     W1, biases1 = decison_set[0]
-    if encode_policy:
-        W_batch = [torch.stack([W[i].unsqueeze(-1).float().to(self.device) for W,biases in decison_set]) for i in range(len(W1))]
-        biases_batch = [torch.stack([biases[i].unsqueeze(-1).float().to(self.device) for W,biases in decison_set]) for i in range(len(biases1))]
-        self.decison_set_4_network = [W_batch, biases_batch]
+    W_batch = [torch.stack([W[i].unsqueeze(-1).float().to(self.device) for W,biases in decison_set]) for i in range(len(W1))]
+    biases_batch = [torch.stack([biases[i].unsqueeze(-1).float().to(self.device) for W,biases in decison_set]) for i in range(len(biases1))]
+    decison_set_4_network = [W_batch, biases_batch]
 
     with torch.no_grad():
       if self.discrete_dist:
-          est_vals, decison_set_latent,  _ = self.model.forward_sample(self.decison_set_4_network, encode_policy=encode_policy)
+          est_vals, decison_set_latent,  _ = self.model.forward_sample(decison_set_4_network)
       else:
-        est_vals, decison_set_latent, _, _ = self.model.forward_sample(self.decison_set_4_network, encode_policy=encode_policy)
+        est_vals, decison_set_latent, _, _ = self.model.forward_sample(decison_set_4_network)
       self.est_vals = est_vals
 
 
@@ -261,7 +266,6 @@ class NeuralLinearPosteriorSampling:
                   else:
                       returns = np.sum(exp.reward[idx: idx + self.num_unroll_steps] * self.gamma ** np.arange(
                           len(exp.reward[idx:idx + self.num_unroll_steps])))
-                  first_states = torch.tensor(np.array(states[idx:idx+1])).float().to(self.device)
 
               else:
                   states = torch.tensor(np.array(exp.obs[idx:idx + self.num_unroll_steps])).to(self.device).float()
@@ -272,14 +276,13 @@ class NeuralLinearPosteriorSampling:
                       torch.tensor(exp.reward[idx:idx + self.num_unroll_steps]).unsqueeze(0).to(self.device),
                       target_values)
                   returns = returns[0, 0].cpu().float().numpy()
-                  first_states = states[0:1]
 
 
 
               labels.append(returns)
 
 
-              new_z = self.model.sample(first_states, contexts)
+              new_z = self.model.sample(contexts)
               features.append(new_z.cpu().float().numpy())
 
       return np.concatenate(features,axis=0), np.stack(policy_vector), np.array(labels)
@@ -404,7 +407,7 @@ class NeuralLinearPosteriorSampling:
 
 
 
-            phi = self.model.sample(obs, contexts)
+            phi = self.model.sample( contexts)
             phi = phi.to(self.dtype)
             # Retrain the network on the original data (data_h)
             self.precision += torch.matmul(phi.T, phi)
@@ -488,10 +491,16 @@ class NeuralLinearPosteriorSampling:
 
       else:
             returns = sample.ret
-            value_hat, z,_,_ = self.model.forward_sample(obs, context)
+            value_hat, z, mu, log_var = self.model.forward_sample(obs, context)
+            kld_loss = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim=1), dim=0)
             likelihood = self.mse_loss(value_hat[:, 0], returns)
 
-      loss = likelihood
+
+      loss = likelihood + self.kld_coeff * kld_loss
+      if self.decoder_coeff > 0:
+          context_hat = self.model.decoder(z)
+          decoder_loss = self.mse_loss(context_hat, context)
+          loss += self.decoder_coeff * decoder_loss
 
       total_loss = loss.item()
       self.optimizer.zero_grad()

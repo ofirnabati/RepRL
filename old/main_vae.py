@@ -24,7 +24,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import pickle
 from shared_noise import SharedNoiseTable, create_shared_noise
-from neural_linear_gae_vae import NeuralLinearPosteriorSampling
+from neural_linear_old import NeuralLinearPosteriorSampling
 
 
 from sparseMuJoCo.envs.mujoco.hopper_v0 import SparseHopperV0 as SparseHopperV0
@@ -55,7 +55,8 @@ class Worker(object):
                  data_rollout_length=1000,
                  delta_std=0.02,
                  samples_per_policy=1,
-                 state_based_value=False):
+                 state_based_value=False,
+                 ):
 
 
         np.random.seed(env_seed)
@@ -65,21 +66,7 @@ class Worker(object):
 
 
         # initialize OpenAI environment for each worker
-        if env_name == 'SparseHalfCheetah-v1':
-            self.env = SparseHalfCheetah()
-        elif env_name == 'SparseHopper-v1':
-            self.env = SparseHopper()
-        elif env_name == 'SparseHalfCheetah-v1':
-            self.env = SparseHalfCheetah()
-        elif env_name == 'SparseAnt-v1':
-            self.env = SparseAnt()
-        elif env_name == 'SparseSwimmer-v1':
-            self.env = SparseSwimmer()
-        elif env_name == 'SparseWalker2d-v1':
-            self.env = SparseWalker2d()
-        elif env_name == 'SparseHumanoid-v1':
-            self.env = SparseHumanoid()
-        elif env_name == 'SparseHalfCheetah-v0':
+        if env_name == 'SparseHalfCheetah-v0':
             self.env = SparseHalfCheetahV0()
         elif env_name == 'SparseHopper-v0':
             self.env = SparseHopperV0()
@@ -94,8 +81,6 @@ class Worker(object):
         else:
             self.env = gym.make(env_name)
         self.env.reset(seed=env_seed)
-        self.seed = env_seed
-        # self.env.seed(env_seed)
 
         # each worker gets access to the shared noise table
         # with independent random streams for sampling
@@ -107,10 +92,6 @@ class Worker(object):
             self.policy = LinearPolicy(policy_params)
         elif policy_params['type'] == 'discrete':
             self.policy = DiscretePolicy(policy_params)
-        elif policy_params['type'] == 'nn':
-            self.policy = StableBaselinePolicy(policy_params['ob_dim'], policy_params['ac_dim'],
-                                               policy_params['ob_filter'],
-                                               device='cpu:0')
         else:
             raise NotImplementedError
 
@@ -154,6 +135,8 @@ class Worker(object):
         else:
             ob = self.env.reset()
         for i in range(rollout_length):
+            if len(ob.shape) > 1:
+                ob = ob.flatten()
             obss.append(ob)
             action = self.policy.act(ob)
             ob, reward, done, _ = self.env.step(action)
@@ -173,12 +156,7 @@ class Worker(object):
         if self.state_based_value and not evaluate:
             self.ob = ob
 
-        # exps = utils.DictListObject()
-        # exps.obs = obss
-        # exps.action = np.concatenate(actions)
-        # exps.reward = np.array(rewards)
-        # exps.mask = np.array(masks)
-        # exps.step = np.array(step_id)
+
 
         return total_reward, steps, obss, np.stack(actions), np.array(rewards), np.array(masks), np.array(step_id)
 
@@ -201,9 +179,6 @@ class Worker(object):
                 # set to false so that evaluation rollouts are not used for updating state statistics
                 self.policy.update_filter = False
 
-                # for evaluation we do not shift the rewards (shift = 0) and we use the
-                # default rollout length (1000 for the MuJoCo locomotion tasks)
-                # reward, r_steps = self.rollout(shift = 0., rollout_length = self.env.spec.timestep_limit)
                 reward, r_steps, obss, actions, rewards, masks, step_id = self.rollout(shift = 0., rollout_length=self.rollout_length,evaluate=evaluate)
                 rollout_rewards.append(reward)
                 obss_arr.append(obss)
@@ -263,10 +238,7 @@ class Worker(object):
         return
 
 
-class ARSLearner(object):
-    """
-    Object class implementing the ARS algorithm.
-    """
+class Learner(object):
 
     def __init__(self, env_name='HalfCheetah-v1',
                  policy_params=None,
@@ -279,7 +251,7 @@ class ARSLearner(object):
                  rollout_length=1000,
                  data_rollout_length=1000,
                  step_size=0.01,
-                 shift='constant zero',
+                 shift=0,
                  params=None,
                  seed=123,
                  storage=None,
@@ -288,8 +260,6 @@ class ARSLearner(object):
                  save_exp=False,
                  soft_bandit_update=True):
 
-        # logz.configure_output_dir(logdir)
-        # logz.save_params(params)
 
         env = gym.make(env_name)
         self.env_name = env_name
@@ -312,6 +282,7 @@ class ARSLearner(object):
         self.deltas_used = deltas_used
         self.num_bandit_deltas = num_bandit_deltas
         self.rollout_length = rollout_length
+        self.data_rollout_length = data_rollout_length
         self.step_size = step_size
         self.delta_std = delta_std
         self.delta_bandit_std = args.delta_bandit_std
@@ -325,15 +296,14 @@ class ARSLearner(object):
         self.bandit_algo = bandit_algo
         print('latent dim:', bandit_algo.latent_dim)
         self.storage = storage
-        self.average_first_state = params['average_first_state']
         self.horizon = params['horizon']
         self.discount = params['discount']
         self.eval_freq = params['eval_freq']
         self.max_timesteps = params['max_timesteps']
         self.explore_coeff = params['explore_coeff']
+        self.soft_bandit_update = soft_bandit_update
         self.samples_per_policy = params['samples_per_policy']
         self.do_tsne = params['do_tsne']
-        self.soft_bandit_update = soft_bandit_update
         # create shared table for storing noise
         print("Creating deltas table.")
         deltas_id = create_shared_noise.remote()
@@ -351,7 +321,7 @@ class ARSLearner(object):
                                       data_rollout_length=data_rollout_length,
                                       delta_std=delta_std,
                                       samples_per_policy=self.samples_per_policy,
-                                      state_based_value=params['state_based_value']) for i in range(num_workers)]
+                                      ) for i in range(num_workers)]
 
 
         # initialize policy
@@ -359,8 +329,6 @@ class ARSLearner(object):
             self.policy = LinearPolicy(policy_params)
         elif policy_params['type'] == 'discrete':
             self.policy = DiscretePolicy(policy_params)
-        elif policy_params['type'] == 'nn':
-            self.policy = StableBaselinePolicy(policy_params['ob_dim'], policy_params['ac_dim'], policy_params['ob_filter'], device='cpu:0')
         else:
             raise NotImplementedError
 
@@ -368,7 +336,6 @@ class ARSLearner(object):
         self.policy_history_set = [self.w_policy for _ in range(params['policy_history_set_size'])]
         # initialize optimization algorithm
         self.optimizer = optimizers.SGD(self.w_policy, self.step_size)
-        print("Initialization of ARS complete.")
 
     def aggregate_rollouts(self, num_rollouts = None, evaluate = False):
         """
@@ -409,13 +376,13 @@ class ARSLearner(object):
         rollout_rewards, deltas_idx = [], []
 
 
-        loss = []
+        loss = None
         rollout_len = 0
         for result in results_one:
             if not evaluate:
                 # self.timesteps += result["steps"]
                 rollout_len += result["steps"]
-                for j in range(num_rollouts):
+                for j in range(num_rollouts * self.samples_per_policy):
                     delta = self.deltas.get(result['deltas_idx'][j], self.w_policy.size)
                     delta = self.delta_std * delta
                     exp_pos = utils.DictListObject()
@@ -432,7 +399,7 @@ class ARSLearner(object):
                     loss_pos = self.bandit_algo.update(exp_pos, update_par)
                     # loss_pos = self.bandit_algo.update(exp_pos, self.w_policy.reshape(-1))
                     if loss_pos is not None:
-                        loss.append(loss_pos)
+                        loss = loss_pos
 
 
                     exp_neg = utils.DictListObject()
@@ -449,7 +416,7 @@ class ARSLearner(object):
                     loss_neg = self.bandit_algo.update(exp_neg, update_par)
                     # loss_neg = self.bandit_algo.update(exp_neg, self.w_policy.reshape(-1))
                     if loss_neg is not None:
-                        loss.append(loss_neg)
+                        loss = loss_neg
 
             deltas_idx += result['deltas_idx']
             rollout_rewards += result['rollout_rewards']
@@ -460,39 +427,40 @@ class ARSLearner(object):
 
                 # self.timesteps += result["steps"]
                 rollout_len += result["steps"]
-                delta = self.deltas.get(result['deltas_idx'][0], self.w_policy.size)
-                delta = self.delta_std * delta
-                exp_pos = utils.DictListObject()
-                exp_pos.obs = result['obss_arr'][0][0]
-                exp_pos.action = result['actions_arr'][0][0]
-                exp_pos.reward = result['rewards_arr'][0][0]
-                exp_pos.mask = result['masks_arr'][0][0]
-                exp_pos.step = result['step_id_arr'][0][0]
-                if self.params['filter'] == 'MeanStdFilter':
-                    w = ray.get(self.workers[0].get_weights_plus_stats.remote())
-                    update_par = np.concatenate([self.w_policy.reshape(-1) + delta, w[1], w[2]])
-                else:
-                    update_par = self.w_policy.reshape(-1) + delta
-                loss_pos = self.bandit_algo.update(exp_pos, update_par)
-                # loss_pos = self.bandit_algo.update(exp_pos, self.w_policy.reshape(-1))
-                if loss_pos is not None:
-                    loss.append(loss_pos)
+                for j in range(self.samples_per_policy):
+                    delta = self.deltas.get(result['deltas_idx'][j], self.w_policy.size)
+                    delta = self.delta_std * delta
+                    exp_pos = utils.DictListObject()
+                    exp_pos.obs = result['obss_arr'][0][0]
+                    exp_pos.action = result['actions_arr'][0][0]
+                    exp_pos.reward = result['rewards_arr'][0][0]
+                    exp_pos.mask = result['masks_arr'][0][0]
+                    exp_pos.step = result['step_id_arr'][0][0]
+                    if self.params['filter'] == 'MeanStdFilter':
+                        w = ray.get(self.workers[0].get_weights_plus_stats.remote())
+                        update_par = np.concatenate([self.w_policy.reshape(-1) + delta, w[1], w[2]])
+                    else:
+                        update_par = self.w_policy.reshape(-1) + delta
+                    loss_pos = self.bandit_algo.update(exp_pos, update_par)
+                    # loss_pos = self.bandit_algo.update(exp_pos, self.w_policy.reshape(-1))
+                    if loss_pos is not None:
+                        loss = loss_pos
 
-                exp_neg = utils.DictListObject()
-                exp_neg.obs = result['obss_arr'][0][1]
-                exp_neg.action = result['actions_arr'][0][1]
-                exp_neg.reward = result['rewards_arr'][0][1]
-                exp_neg.mask = result['masks_arr'][0][1]
-                exp_neg.step = result['step_id_arr'][0][1]
-                if self.params['filter'] == 'MeanStdFilter':
-                    w = ray.get(self.workers[0].get_weights_plus_stats.remote())
-                    update_par = np.concatenate([self.w_policy.reshape(-1) - delta, w[1], w[2]])
-                else:
-                    update_par = self.w_policy.reshape(-1) - delta
-                loss_neg = self.bandit_algo.update(exp_neg, update_par)
-                # loss_neg = self.bandit_algo.update(exp_neg, self.w_policy.reshape(-1))
-                if loss_neg is not None:
-                    loss.append(loss_neg)
+                    exp_neg = utils.DictListObject()
+                    exp_neg.obs = result['obss_arr'][0][1]
+                    exp_neg.action = result['actions_arr'][0][1]
+                    exp_neg.reward = result['rewards_arr'][0][1]
+                    exp_neg.mask = result['masks_arr'][0][1]
+                    exp_neg.step = result['step_id_arr'][0][1]
+                    if self.params['filter'] == 'MeanStdFilter':
+                        w = ray.get(self.workers[0].get_weights_plus_stats.remote())
+                        update_par = np.concatenate([self.w_policy.reshape(-1) - delta, w[1], w[2]])
+                    else:
+                        update_par = self.w_policy.reshape(-1) - delta
+                    loss_neg = self.bandit_algo.update(exp_neg, update_par)
+                    # loss_neg = self.bandit_algo.update(exp_neg, self.w_policy.reshape(-1))
+                    if loss_neg is not None:
+                        loss = loss_neg
 
             deltas_idx += result['deltas_idx']
             rollout_rewards += result['rollout_rewards']
@@ -539,8 +507,6 @@ class ARSLearner(object):
         ## Bandits from here
         t1 = time.time()
         G = 0
-        max_val = -1e10
-        max_policy = self.policy_history_set[0]
         with torch.no_grad():
                 if self.bandit_algo.method == 'ts':
                     self.bandit_algo.sample_ts()

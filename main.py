@@ -23,7 +23,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
 from shared_noise import SharedNoiseTableSet, create_shared_noise
-from neural_linear_gae_dws import NeuralLinearPosteriorSampling
+from neural_linear import NeuralLinearPosteriorSampling
 
 from sparseMuJoCo.envs.mujoco.hopper_v0 import SparseHopperV0 as SparseHopperV0
 from sparseMuJoCo.envs.mujoco.humanoid_v0 import SparseHumanoidV0 as SparseHumanoidV0
@@ -88,6 +88,10 @@ class Worker(object):
             self.policy = LinearPolicy(policy_params)
         elif policy_params['type'] == 'discrete':
             self.policy = DiscretePolicy(policy_params)
+        elif policy_params['type'] == 'nn':
+            self.policy = StableBaselinePolicy(policy_params['ob_dim'], policy_params['ac_dim'],
+                                          policy_params['ob_filter'],
+                                          device='cpu:0')
         else:
             raise NotImplementedError
         self.deltas = SharedNoiseTableSet(deltas,  self.policy.get_weights(), env_seed + 7)
@@ -341,6 +345,10 @@ class Learner(object):
             self.policy = LinearPolicy(policy_params)
         elif policy_params['type'] == 'discrete':
             self.policy = DiscretePolicy(policy_params)
+        elif policy_params['type'] == 'nn':
+            self.policy = StableBaselinePolicy(policy_params['ob_dim'], policy_params['ac_dim'],
+                                          policy_params['ob_filter'],
+                                          device='cpu:0')
         else:
             raise NotImplementedError
 
@@ -810,6 +818,10 @@ def run_exp(args):
         policy = LinearPolicy(policy_params)
     elif policy_params['type'] == 'discrete':
         policy = DiscretePolicy(policy_params)
+    elif policy_params['type'] == 'nn':
+        policy = StableBaselinePolicy(policy_params['ob_dim'], policy_params['ac_dim'],
+                                           policy_params['ob_filter'],
+                                           device='cpu:0')
     else:
         raise NotImplementedError
 
@@ -817,7 +829,10 @@ def run_exp(args):
     if params['filter'] == 'MeanStdFilter':
         mu, std_matrix = policy.get_stats()
         W = std_matrix + W
-        bias = mu + bias
+        if len(bias) > 0:
+            bias = mu + bias
+        else:
+            bias = mu
 
 
     weight_shapes = tuple(w.shape[:2] for w in W)
@@ -980,6 +995,8 @@ if __name__ == '__main__':
         args.num_unroll_steps = args.rollout_length
     if args.explore_coeff == 0.0:
         args.training_freq_network = 100000000000
+    if args.policy_type != 'linear':
+        args.dec_coeff = 0.0
     device = torch.device("cuda:" + str(args.device) if torch.cuda.is_available() else "cpu")
     ray.init(num_gpus=args.num_gpus, num_cpus=args.num_cpus)
 
