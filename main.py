@@ -1,10 +1,3 @@
-'''
-Parallel implementation of the Augmented Random Search method.
-Horia Mania --- hmania@berkeley.edu
-Aurelia Guy
-Benjamin Recht 
-'''
-
 
 import torch
 import random
