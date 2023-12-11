@@ -1,7 +1,7 @@
 # RepRL
 Representation-Driven Reinforcement Learning 
 <p align="center"> 
-    <img src=figs/RepRL.pdf  height="400">
+    <img src=RepRL.pdf  height="400">
 </p>
 
 Code is based on the code provided by "Simple random search provides a competitive approach to reinforcement learning" (Mania et al.) at https://github.com/modestyachts/ARS/tree/master.
