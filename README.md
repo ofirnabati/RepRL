@@ -5,7 +5,7 @@
 </p>
 
 ## Acknowledgement
-This code is based on the code provided by "Simple random search provides a competitive approach to reinforcement learning" (Mania et al.) at https://github.com/modestyachts/ARS/tree/master. 
+This code is based on the code provided by "Simple random search provides a competitive approach to reinforcement learning" (Mania et al.) at https://github.com/modestyachts/ARS. 
 
 The code for the Deep Weight Space architecture was taken from the code provided by "Equivariant Architectures for Learning in Deep Weight Spaces" (Navon et al.) at https://github.com/AvivNavon/DWSNets. 
 
